@@ -27,6 +27,15 @@ class InvalidTransition(DomainError):
     """The requested state transition is not valid."""
 
 
+class RecomputeError(DomainError):
+    """A recompute run was interrupted at a checkpoint; it can be retried."""
+
+    def __init__(self, message, run_id=None, checkpoint=None):
+        super().__init__(message)
+        self.run_id = run_id
+        self.checkpoint = checkpoint
+
+
 class Role(str, Enum):
     viewer = "viewer"
     admin = "admin"

@@ -85,6 +85,24 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                query = parse_qs(parsed.query)
+                if parts == ["api", "lab-results"]:
+                    sample_id = query.get("sample_id", [None])[0]
+                    status = query.get("status", [None])[0]
+                    items = service.list("lab_result", status=status)
+                    if sample_id:
+                        items = [item for item in items if item["data"].get("sample_id") == sample_id]
+                    return self._send(200, {"items": items})
+                if parts == ["api", "conflicts"]:
+                    return self._send(200, {"items": service.list_conflicts()})
+                if parts == ["api", "trace-runs"]:
+                    return self._send(200, {"items": service.list_runs()})
+                if len(parts) == 3 and parts[:2] == ["api", "trace-runs"]:
+                    return self._send(200, service.get(parts[2]))
+                if parts == ["api", "notifications"]:
+                    return self._send(200, {"items": service.list_notifications()})
+                if len(parts) == 3 and parts[:2] == ["api", "notifications"]:
+                    return self._send(200, service.get(parts[2]))
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -138,6 +156,14 @@ def create_handler(service, rules, static_dir):
                         200,
                         service.transition(actor, parts[2], parts[3], self._body(), None),
                     )
+                if parts == ["api", "lab-results"]:
+                    return self._send(201, service.submit_lab_result(actor, self._body(), self.headers.get("Idempotency-Key")))
+                if len(parts) == 4 and parts[:2] == ["api", "consignments"] and parts[3] == "recompute":
+                    return self._send(200, service.recompute(actor, parts[2]))
+                if len(parts) == 4 and parts[:2] == ["api", "notifications"] and parts[3] == "confirm":
+                    return self._send(200, service.confirm_notification(actor, parts[2]))
+                if parts == ["api", "upgrade"]:
+                    return self._send(200, service.upgrade_propagation(actor))
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()
                     idem = self.headers.get("Idempotency-Key")

@@ -27,6 +27,16 @@ def _validate_release(actor, entity, data, lookup):
     return {"released_by": actor.user_id}
 
 
+def _validate_lab_result(actor, data, lookup):
+    if data.get("pest_found") is None:
+        raise ValidationError("pest_found is required for lab results")
+    if not data.get("sample_id"):
+        raise ValidationError("sample_id is required")
+    if not data.get("consignment_id"):
+        raise ValidationError("consignment_id is required")
+    return {}
+
+
 def trace_downstream(consignments, start_id):
     pending = [start_id]
     visited = set()
@@ -43,18 +53,99 @@ def trace_downstream(consignments, start_id):
     return result
 
 
-CUSTOM_CREATE = {'consignment': _validate_consignment}
-CUSTOM_TRANSITIONS = {('consignment', 'quarantine'): _validate_quarantine, ('consignment', 'release'): _validate_release}
+def _consignment_children(consignments, parent_id):
+    return [
+        item
+        for item in consignments
+        if (item.get("data", {}) or {}).get("parent_id") == parent_id
+    ]
+
+
+def downstream_facilities(consignments, facilities, start_id, edges=None):
+    """沿 parent_id 链和传播边从 start_id 向下游 BFS，返回受影响种植点 id（去重、保序）。
+
+    种植点与批次的关联有三种来源：目的地名称匹配、facility 上显式登记的
+    consignment_ids、以及按原发地/目的地补齐的传播边。
+    """
+    by_id = {item["id"]: item for item in consignments}
+    edge_set = set(edges or [])
+    visited_consignments = set()
+    visited_facilities = []
+    queue = [start_id]
+    while queue:
+        current = queue.pop(0)
+        if current in visited_consignments:
+            continue
+        visited_consignments.add(current)
+        consignment = by_id.get(current)
+        if consignment is None:
+            continue
+        cdata = consignment.get("data", {}) or {}
+        for facility in facilities:
+            fid = facility["id"]
+            if fid in visited_facilities:
+                continue
+            data = facility.get("data", {}) or {}
+            linked = data.get("consignment_ids") or []
+            if (
+                cdata.get("destination")
+                and data.get("name") == cdata["destination"]
+            ) or current in linked or (current, fid) in edge_set:
+                visited_facilities.append(fid)
+        for child in _consignment_children(consignments, current):
+            if child["id"] not in visited_consignments:
+                queue.append(child["id"])
+        for src, dst in edge_set:
+            if src == current and dst in by_id and dst not in visited_consignments:
+                queue.append(dst)
+    return visited_facilities
+
+
+def infer_consignment_parent(consignment, others):
+    """按原发地/目的地推断上游批次：目的地等于本批次原发地的批次即为父批。"""
+    cdata = consignment.get("data", {}) or {}
+    origin = cdata.get("origin")
+    if not origin:
+        return None
+    for other in others:
+        if other["id"] == consignment["id"]:
+            continue
+        odata = other.get("data", {}) or {}
+        if odata.get("destination") == origin:
+            return other["id"]
+    return None
+
+
+def infer_facility_links(consignment, facilities):
+    """目的地与批次目的地同名的种植点即下游关联点。"""
+    cdata = consignment.get("data", {}) or {}
+    destination = cdata.get("destination")
+    links = []
+    for facility in facilities:
+        data = facility.get("data", {}) or {}
+        if destination and data.get("name") == destination:
+            links.append(facility["id"])
+    return links
+
+
+CUSTOM_CREATE = {
+    'consignment': _validate_consignment,
+    'lab_result': _validate_lab_result,
+}
+CUSTOM_TRANSITIONS = {
+    ('consignment', 'quarantine'): _validate_quarantine,
+    ('consignment', 'release'): _validate_release,
+}
 
 
 class RuleEngine:
-    ALIASES = {'consignments': 'consignment', 'facilities': 'facility'}
-    INITIAL_STATUS = {'consignment': 'declared', 'facility': 'registered'}
-    TRANSITIONS = {'consignment': {'inspect': (('declared',), 'inspected'), 'quarantine': (('inspected',), 'quarantined'), 'release': (('inspected',), 'released'), 'destroy': (('quarantined',), 'destroyed'), 'recheck': (('quarantined',), 'inspected')}, 'facility': {'trace': (('registered',), 'traced')}}
-    CREATE_REQUIRED = {'consignment': ('code', 'origin', 'destination'), 'facility': ('name', 'address')}
+    ALIASES = {'consignments': 'consignment', 'facilities': 'facility', 'lab-results': 'lab_result', 'lab_results': 'lab_result', 'trace-runs': 'trace_run', 'trace_runs': 'trace_run', 'notifications': 'notification'}
+    INITIAL_STATUS = {'consignment': 'declared', 'facility': 'registered', 'lab_result': 'effective', 'trace_run': 'in_progress', 'notification': 'pending'}
+    TRANSITIONS = {'consignment': {'inspect': (('declared',), 'inspected'), 'quarantine': (('inspected',), 'quarantined'), 'release': (('inspected',), 'released'), 'destroy': (('quarantined',), 'destroyed'), 'recheck': (('quarantined',), 'inspected')}, 'facility': {'trace': (('registered',), 'traced')}, 'notification': {'confirm': (('pending',), 'confirmed')}}
+    CREATE_REQUIRED = {'consignment': ('code', 'origin', 'destination'), 'facility': ('name', 'address'), 'lab_result': ('sample_id', 'consignment_id', 'pest_found')}
     ACTION_REQUIRED = {('consignment', 'inspect'): ('inspector', 'inspection_result'), ('consignment', 'quarantine'): ('pest_found', 'sample_id'), ('consignment', 'release'): ('pest_found', 'treatment'), ('consignment', 'destroy'): ('method', 'witnessed_by'), ('consignment', 'recheck'): ('sample_id',), ('facility', 'trace'): ('consignment_ids',)}
-    CREATE_ROLES = {'consignment': ('admin', 'inspector'), 'facility': ('admin', 'quarantine')}
-    ROLE_ACTIONS = {'inspect': ('admin', 'inspector'), 'quarantine': ('admin', 'quarantine'), 'release': ('admin', 'quarantine'), 'destroy': ('admin', 'quarantine'), 'recheck': ('admin', 'inspector'), 'trace': ('admin', 'quarantine')}
+    CREATE_ROLES = {'consignment': ('admin', 'inspector'), 'facility': ('admin', 'quarantine'), 'lab_result': ('admin', 'inspector', 'lab')}
+    ROLE_ACTIONS = {'inspect': ('admin', 'inspector'), 'quarantine': ('admin', 'quarantine'), 'release': ('admin', 'quarantine'), 'destroy': ('admin', 'quarantine'), 'recheck': ('admin', 'inspector'), 'trace': ('admin', 'quarantine'), 'confirm': ('admin', 'quarantine')}
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)

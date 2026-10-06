@@ -54,6 +54,17 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS propagation (
+                    id TEXT PRIMARY KEY,
+                    from_id TEXT NOT NULL,
+                    to_id TEXT NOT NULL,
+                    to_kind TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(from_id, to_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_propagation_from
+                    ON propagation(from_id);
             """)
 
     @staticmethod
@@ -195,6 +206,62 @@ class SQLiteRepository:
                 "VALUES (?, ?, ?, ?)",
                 (actor_id, idem_key, entity_id, utcnow()),
             )
+
+    def add_propagation_edge(self, from_id, to_id, to_kind, source):
+        edge_id = "%s->%s" % (from_id, to_id)
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO propagation(id, from_id, to_id, to_kind, source, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (edge_id, from_id, to_id, to_kind, source, utcnow()),
+            )
+        return edge_id
+
+    def list_propagation_edges(self):
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT from_id, to_id, to_kind, source FROM propagation"
+            ).fetchall()
+        return [
+            {
+                "from_id": row["from_id"],
+                "to_id": row["to_id"],
+                "to_kind": row["to_kind"],
+                "source": row["source"],
+            }
+            for row in rows
+        ]
+
+    def create_lab_result(self, entity_id, data, actor_id):
+        """写入实验室结果，并按 sample_id 原子地判定生效/冲突。
+
+        同一 sample_id 已有生效结果时，后到的结果保留现场记录（status=conflicted），
+        不改变生效结论；否则先生效。整个判定在一个事务内完成，避免并发双写。
+        返回 (entity, conflict)。
+        """
+        sample_id = data["sample_id"]
+        now = utcnow()
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT id FROM entities WHERE kind='lab_result' AND status='effective' "
+                "AND json_extract(data, '$.sample_id') = ? LIMIT 1",
+                (sample_id,),
+            ).fetchone()
+            conflict = row is not None
+            status = "conflicted" if conflict else "effective"
+            if conflict:
+                data = dict(data)
+                data["conflict_with"] = row["id"]
+                payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+            connection.execute(
+                "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+                "VALUES (?, 'lab_result', ?, 1, ?, ?, ?, ?)",
+                (entity_id, status, payload, actor_id, now, now),
+            )
+            connection.commit()
+        return self.get_entity(entity_id), conflict
 
     def ping(self):
         with self._connect() as connection:
