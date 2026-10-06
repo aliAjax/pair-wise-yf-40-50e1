@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, Optional
 
@@ -9,6 +10,24 @@ class DomainError(Exception):
 
 class ValidationError(DomainError):
     """Input does not satisfy a domain rule."""
+
+
+def normalize_effective_at(value, default=None):
+    """Normalize a date/datetime input to a UTC ISO-8601 string.
+
+    Effective time drives the traceability ledger, so every stored
+    timestamp must be comparable lexicographically.
+    """
+    if value in (None, ""):
+        return default
+    text = str(value).strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        raise ValidationError("invalid effective time: " + str(value))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat(timespec="seconds")
 
 
 class PermissionDenied(DomainError):

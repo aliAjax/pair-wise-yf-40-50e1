@@ -22,7 +22,13 @@
 GET  /api/&lt;kind&gt;
 POST /api/&lt;kind&gt;
 GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre>
+POST /api/entities/&lt;id&gt;/actions
+POST /api/consignments/&lt;id&gt;/lab          提交实验室结果（先到生效/后到冲突）
+GET  /api/consignments/&lt;id&gt;/runs         追溯账分代记录
+POST /api/runs/&lt;id&gt;/resume               失败账断点重试
+GET  /api/notifications                  通知版本（voided/acknowledged 均可查）
+POST /api/notifications/&lt;id&gt;/acknowledge 确认通知
+GET  /api/links                          按生效时间有效的传播边</pre>
 </main>
 <script>
 async function checkHealth() {

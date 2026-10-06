@@ -24,7 +24,36 @@ python3 app.py --db ./data.db --port 8306
 
 ## 核心对象
 
-- `consignment`：检疫批次；`facility`：温室、苗圃或下游种植点。
+- `consignment`：检疫批次（含 `origin`/`destination`，在口岸与种植点之间调运）。
+- `facility`：温室、苗圃或下游种植点。
+- `propagation_links`：按生效时间（`effective_from`/`effective_to`）有效的传播有向边；批次创建时按原发地→目的地自动登记。
+- `lab_submissions`：实验室结果，按采集号 `sample_id` 先到生效，后到者以 `conflict` 保留现场记录。
+- `trace_runs` / `trace_run_items`：按结果生效时间重算的追溯账（分代 generation），含逐批次断点。
+- `notifications`：给下游种植点的追溯通知，按 `(批次, 对象)` 维护版本链。
+
+## 追溯账规则
+
+1. **确认带虫即重算**：某批结果 `pest_found=true` 生效后，从该批目的地出发、沿生效时间点上有效的传播边向下游 BFS，对目的地点和每个下游种植点发通知。
+2. **通知版本**：重算时未确认（`issued`）的通知置 `voided` 并以新版本重发（`supersedes_id`/`superseded_by_id` 串联）；已确认（`acknowledged`）的通知保留原版本，不重复通知。
+3. **晚到结果**：新的生效结果到达时，该批未完成的追溯账（`pending/running/failed`）立即 `invalidated` 并重新算账；已完成账及其结论原样保留可查。晚到的阴性翻案会把旧结论里未确认通知作废，且不再发阳性通知。
+4. **采集号冲突**：两个查验员同时提交同一 `sample_id`，数据库部分唯一索引 + 即时事务保证先到的 `effective`，后到的保留为 `conflict` 现场记录并回链胜者，不驱动追溯账。
+5. **断点重试**：重算按批次目标逐条处理并写检查点；通知发行以 `(run_id,target)` 台账幂等。失败后账置 `failed`，从断点恢复，处理过的批次不重复通知。
+6. **旧数据升级**：建表用 `PRAGMA user_version` 做增量迁移；历史批次缺传播关系时，按 `origin→destination` 回填（`source=migration`，生效时间取批次创建时间），幂等可重复。历史实体、审计与通知只增不删，链接始终可打开。
+
+## 追溯账接口
+
+- `POST /api/links`：手工登记传播边 `{upstream,downstream,consignment_id,effective_from,effective_to}`。
+- `GET /api/links` / `GET /api/links?upstream=...`：查传播边。
+- `POST /api/links/backfill`（admin）：按原发地/目的地补旧数据的传播边，返回新增条数。
+- `POST /api/consignments/<id>/lab`：提交实验室结果 `{sample_id,pest_found,pest_name,finding,effective_at}`；生效则同步重算，冲突则返回 `conflict` 与双方记录。
+- `GET /api/consignments/<id>/lab`、`GET /api/lab?sample_id=&status=`：查结果（含 conflict）。
+- `GET /api/consignments/<id>/trace-preview?effective_at=`：只算不落地，预览下游。
+- `POST /api/consignments/<id>/recompute`：手动重算（取该批最新生效结果）。
+- `GET /api/runs?status=`、`GET /api/runs/<id>`：追溯账列表 / 含逐批次断点的详情。
+- `POST /api/runs/<id>/resume`：失败账从断点继续。
+- `GET /api/consignments/<id>/runs|notifications`：某批的账与通知（通知默认含 voided，可加 `include_void=false`）。
+- `GET /api/notifications`：全部通知版本。
+- `POST /api/notifications/<id>/acknowledge`：确认通知（voided 版本不可确认，返回 409）。
 
 ## 主要接口
 

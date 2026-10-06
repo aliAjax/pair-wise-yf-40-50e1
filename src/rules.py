@@ -5,6 +5,7 @@ from .domain import (
     InvalidTransition,
     PermissionDenied,
     ValidationError,
+    normalize_effective_at,
 )
 
 
@@ -43,6 +44,109 @@ def trace_downstream(consignments, start_id):
     return result
 
 
+def active_propagation_edges(edges, effective_at):
+    """Edges that are already in effect at ``effective_at``.
+
+    When several links share the same upstream/downstream pair, only the
+    earliest effective one applies at that instant.
+    """
+    candidates = {}
+    for edge in edges:
+        if edge.get("effective_from") and edge["effective_from"] > effective_at:
+            continue
+        if edge.get("effective_to") and edge["effective_to"] <= effective_at:
+            continue
+        key = (edge["upstream"], edge["downstream"])
+        current = candidates.get(key)
+        if current is None or (edge.get("effective_from") or "") < (current.get("effective_from") or ""):
+            candidates[key] = edge
+    return list(candidates.values())
+
+
+def trace_downstream_facilities(edges, start_location, effective_at):
+    """BFS along propagation links effective at ``effective_at``.
+
+    Returns a list of ``{"location", "via_edge_id", "consignment_ids"}``
+    for each downstream planting point, in discovery order.
+    """
+    active = active_propagation_edges(edges, effective_at)
+    pending = [start_location]
+    visited = {start_location}
+    findings = {}
+    order = []
+    while pending:
+        current = pending.pop(0)
+        for edge in active:
+            if edge["upstream"] != current:
+                continue
+            downstream = edge["downstream"]
+            if downstream not in findings:
+                order.append(downstream)
+                findings[downstream] = {
+                    "location": downstream,
+                    "via_edge_id": edge["id"],
+                    "consignment_ids": [],
+                }
+            if edge.get("consignment_id"):
+                findings[downstream]["consignment_ids"].append(edge["consignment_id"])
+            if downstream not in visited:
+                visited.add(downstream)
+                pending.append(downstream)
+    return [findings[name] for name in order]
+
+
+def validate_lab_result(data):
+    sample_id = data.get("sample_id")
+    if not sample_id:
+        raise ValidationError("missing required field: sample_id")
+    if not isinstance(data.get("pest_found"), bool):
+        raise ValidationError("pest_found must be true or false")
+    payload = {
+        "sample_id": str(sample_id),
+        "pest_found": bool(data["pest_found"]),
+        "pest_name": data.get("pest_name") or "",
+        "finding": data.get("finding") or data.get("lab_note") or "",
+    }
+    effective_at = normalize_effective_at(data.get("effective_at"))
+    if effective_at:
+        payload["effective_at"] = effective_at
+    return payload
+
+
+def validate_propagation_link(data):
+    upstream = data.get("upstream")
+    downstream = data.get("downstream")
+    if not upstream:
+        raise ValidationError("missing required field: upstream")
+    if not downstream:
+        raise ValidationError("missing required field: downstream")
+    if upstream == downstream:
+        raise ValidationError("upstream and downstream must differ")
+    payload = {
+        "upstream": str(upstream),
+        "downstream": str(downstream),
+    }
+    if data.get("consignment_id"):
+        payload["consignment_id"] = str(data["consignment_id"])
+    effective_from = normalize_effective_at(data.get("effective_from"))
+    if effective_from:
+        payload["effective_from"] = effective_from
+    effective_to = normalize_effective_at(data.get("effective_to"))
+    if effective_to:
+        payload["effective_to"] = effective_to
+    if effective_from and effective_to and effective_to <= effective_from:
+        raise ValidationError("effective_to must be after effective_from")
+    return payload
+
+
+def ack_target(payload, facilities, location):
+    """Resolve a location name to a registered facility id when possible."""
+    for facility in facilities:
+        if facility["data"].get("name") == location:
+            payload["facility_id"] = facility["id"]
+    return payload
+
+
 CUSTOM_CREATE = {'consignment': _validate_consignment}
 CUSTOM_TRANSITIONS = {('consignment', 'quarantine'): _validate_quarantine, ('consignment', 'release'): _validate_release}
 
@@ -55,6 +159,14 @@ class RuleEngine:
     ACTION_REQUIRED = {('consignment', 'inspect'): ('inspector', 'inspection_result'), ('consignment', 'quarantine'): ('pest_found', 'sample_id'), ('consignment', 'release'): ('pest_found', 'treatment'), ('consignment', 'destroy'): ('method', 'witnessed_by'), ('consignment', 'recheck'): ('sample_id',), ('facility', 'trace'): ('consignment_ids',)}
     CREATE_ROLES = {'consignment': ('admin', 'inspector'), 'facility': ('admin', 'quarantine')}
     ROLE_ACTIONS = {'inspect': ('admin', 'inspector'), 'quarantine': ('admin', 'quarantine'), 'release': ('admin', 'quarantine'), 'destroy': ('admin', 'quarantine'), 'recheck': ('admin', 'inspector'), 'trace': ('admin', 'quarantine')}
+    LEDGER_ROLES = ('admin', 'inspector', 'lab', 'quarantine')
+    ACK_ROLES = ('admin', 'inspector', 'quarantine')
+
+    def ensure_ledger_role(self, actor):
+        self._ensure_role(actor, self.LEDGER_ROLES)
+
+    def ensure_ack_role(self, actor):
+        self._ensure_role(actor, self.ACK_ROLES)
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
